@@ -83,12 +83,13 @@ class TokenSender:
         random_remaining_eth = random.uniform(min_remaining, max_remaining)
         return self.w3.to_wei(random_remaining_eth, 'ether'), random_remaining_eth
 
-    def get_current_gas_price(self):
+    def get_current_gas_price(self, force_refresh=False):
         """Получает текущую цену газа из сети с кэшированием"""
         current_time = time.time()
         
-        # Проверяем кэш
-        if (self._gas_price_cache is not None and 
+        # Проверяем кэш (если не принудительное обновление)
+        if (not force_refresh and 
+            self._gas_price_cache is not None and 
             self._gas_price_cache_time is not None and 
             current_time - self._gas_price_cache_time < self._cache_duration):
             return self._gas_price_cache
@@ -119,7 +120,7 @@ class TokenSender:
         start_time = datetime.now()
         
         while True:
-            gas_price_wei, gas_price_gwei = self.get_current_gas_price()
+            gas_price_wei, gas_price_gwei = self.get_current_gas_price(force_refresh=True)  # Принудительное обновление
             
             if gas_price_wei is None:
                 self.logger.warning(f"[Аккаунт {account_id}] Не удалось получить цену газа, продолжаем без проверки")
@@ -150,11 +151,20 @@ class TokenSender:
             
             await asyncio.sleep(check_interval)
 
-    def get_gas_price(self):
+    def get_gas_price(self, force_refresh=False):
         """Получает рекомендуемую цену газа"""
         if self.config['transaction'].get('use_dynamic_gas', False):
             try:
-                gas_price = self.w3.eth.gas_price
+                # При принудительном обновлении получаем свежую цену газа
+                if force_refresh:
+                    gas_price = self.w3.eth.gas_price
+                else:
+                    gas_price_data = self.get_current_gas_price()
+                    if gas_price_data and gas_price_data[0]:
+                        gas_price = gas_price_data[0]
+                    else:
+                        gas_price = self.w3.eth.gas_price
+                
                 multiplier = self.config['transaction'].get('gas_price_multiplier', 1.2)
                 gas_price = int(gas_price * multiplier)
                 return gas_price
@@ -244,49 +254,6 @@ class TokenSender:
                 
                 self.logger.info(f"[Аккаунт {account_id}] Баланс проверен: {balance_eth:.8f} ETH (минимум: {min_balance} ETH) ✓")
 
-            # Получаем цену газа и лимит
-            gas_price = self.get_gas_price()
-            gas_limit = self.config['transaction']['gas_limit']
-
-            # Вычисляем сумму для отправки
-            amount_wei, target_remaining = self.calculate_send_amount(balance, gas_price, gas_limit)
-            
-            if amount_wei <= 0:
-                error_msg = "Невозможно отправить транзакцию: недостаточно средств для покрытия комиссии и остатка"
-                self.logger.log_account_failed(account_id, error_msg)
-                self.stats['failed_accounts'].append({
-                    'account_id': account_id,
-                    'address': from_address,
-                    'reason': error_msg
-                })
-                return False
-
-            # Логируем информацию о транзакции
-            remaining_balance = balance - amount_wei - (gas_price * gas_limit)
-            remaining_eth = float(self.w3.from_wei(remaining_balance, 'ether'))
-            
-            min_range = self.config['transaction']['random_remaining_balance_eth']['min']
-            max_range = self.config['transaction']['random_remaining_balance_eth']['max']
-            
-            amount_eth = float(self.w3.from_wei(amount_wei, 'ether'))
-            
-            self.logger.info(f"[Аккаунт {account_id}] Отправляем весь баланс: {amount_eth:.8f} ETH")
-            self.logger.info(f"[Аккаунт {account_id}] 🎲 Случайный остаток: {target_remaining:.8f} ETH (диапазон: {min_range}-{max_range} ETH)")
-            self.logger.info(f"[Аккаунт {account_id}] Останется на кошельке: {remaining_eth:.8f} ETH")
-
-            # Проверяем баланс на покрытие суммы и газа
-            total_cost = amount_wei + gas_price * gas_limit
-            if balance < total_cost:
-                total_cost_eth = float(self.w3.from_wei(total_cost, 'ether'))
-                error_msg = f"Недостаточно ETH на балансе для суммы и газа. Требуется: {total_cost_eth:.8f} ETH, Доступно: {balance_eth:.8f} ETH"
-                self.logger.log_account_failed(account_id, error_msg)
-                self.stats['failed_accounts'].append({
-                    'account_id': account_id,
-                    'address': from_address,
-                    'reason': error_msg
-                })
-                return False
-
             # 🔥 ПРОВЕРЯЕМ ЦЕНУ ГАЗА НЕПОСРЕДСТВЕННО ПЕРЕД ОТПРАВКОЙ ТРАНЗАКЦИИ
             self.logger.info(f"[Аккаунт {account_id}] 🔍 Проверяем цену газа перед отправкой транзакции...")
             if not await self.wait_for_acceptable_gas_price(account_id):
@@ -302,6 +269,55 @@ class TokenSender:
             # Отправляем транзакцию
             for attempt in range(1, self.config['execution']['retry_count'] + 1):
                 try:
+                    # 🚀 ПОЛУЧАЕМ СВЕЖУЮ ЦЕНУ ГАЗА ДЛЯ КАЖДОЙ ПОПЫТКИ
+                    if attempt > 1:
+                        self.logger.info(f"[Аккаунт {account_id}] 🔄 Попытка {attempt}: обновляем цену газа...")
+                        # Принудительно обновляем кэш газа для повторных попыток
+                        self._gas_price_cache = None
+                    
+                    gas_price = self.get_gas_price(force_refresh=(attempt > 1))
+                    gas_limit = self.config['transaction']['gas_limit']
+
+                    # Пересчитываем сумму для отправки с новой ценой газа
+                    amount_wei, target_remaining = self.calculate_send_amount(balance, gas_price, gas_limit)
+                    
+                    if amount_wei <= 0:
+                        error_msg = "Невозможно отправить транзакцию: недостаточно средств для покрытия комиссии и остатка"
+                        self.logger.log_account_failed(account_id, error_msg)
+                        self.stats['failed_accounts'].append({
+                            'account_id': account_id,
+                            'address': from_address,
+                            'reason': error_msg
+                        })
+                        return False
+
+                    # Логируем информацию о транзакции (только для первой попытки)
+                    if attempt == 1:
+                        remaining_balance = balance - amount_wei - (gas_price * gas_limit)
+                        remaining_eth = float(self.w3.from_wei(remaining_balance, 'ether'))
+                        
+                        min_range = self.config['transaction']['random_remaining_balance_eth']['min']
+                        max_range = self.config['transaction']['random_remaining_balance_eth']['max']
+                        
+                        amount_eth = float(self.w3.from_wei(amount_wei, 'ether'))
+                        
+                        self.logger.info(f"[Аккаунт {account_id}] Отправляем весь баланс: {amount_eth:.8f} ETH")
+                        self.logger.info(f"[Аккаунт {account_id}] 🎲 Случайный остаток: {target_remaining:.8f} ETH (диапазон: {min_range}-{max_range} ETH)")
+                        self.logger.info(f"[Аккаунт {account_id}] Останется на кошельке: {remaining_eth:.8f} ETH")
+
+                    # Проверяем баланс на покрытие суммы и газа
+                    total_cost = amount_wei + gas_price * gas_limit
+                    if balance < total_cost:
+                        total_cost_eth = float(self.w3.from_wei(total_cost, 'ether'))
+                        error_msg = f"Недостаточно ETH на балансе для суммы и газа. Требуется: {total_cost_eth:.8f} ETH, Доступно: {balance_eth:.8f} ETH"
+                        self.logger.log_account_failed(account_id, error_msg)
+                        self.stats['failed_accounts'].append({
+                            'account_id': account_id,
+                            'address': from_address,
+                            'reason': error_msg
+                        })
+                        return False
+
                     nonce = self.w3.eth.get_transaction_count(from_address)
                     tx = {
                         'chainId': self.config['network']['chain_id'],
@@ -324,7 +340,7 @@ class TokenSender:
 
                     if receipt['status'] == 1:
                         explorer_url = self.config.get('explorer', {}).get('base_url', 'https://etherscan.io/tx/')
-                        amount_formatted = f"{amount_eth:.8f}"
+                        amount_formatted = f"{float(self.w3.from_wei(amount_wei, 'ether')):.8f}"
                         
                         self.logger.log_transaction_success(
                             account_id, 
@@ -340,12 +356,12 @@ class TokenSender:
                         self.stats['successful_accounts'].append({
                             'account_id': account_id,
                             'address': from_address,
-                            'amount_sent': amount_eth,
+                            'amount_sent': float(self.w3.from_wei(amount_wei, 'ether')),
                             'gas_used': gas_used,
                             'tx_hash': tx_hash.hex(),
                             'target_remaining': target_remaining
                         })
-                        self.stats['total_sent'] += amount_eth
+                        self.stats['total_sent'] += float(self.w3.from_wei(amount_wei, 'ether'))
                         self.stats['total_gas_used'] += gas_used
                         
                         # Показываем финальный баланс
